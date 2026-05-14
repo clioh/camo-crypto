@@ -1,0 +1,34 @@
+{
+  "name": "camo-crypto",
+  "version": "0.1.0",
+  "description": "Cryptographic primitives for Camo Chat (publicly available encryption source code under EAR §742.15(b)).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./crypto": "./crypto.js",
+    "./keyManager": "./keyManager.js",
+    "./wordlist": "./wordlist.js"
+  },
+  "files": [
+    "index.js",
+    "crypto.js",
+    "keyManager.js",
+    "wordlist.js",
+    "wordlists/",
+    "LICENSE",
+    "README.md"
+  ],
+  "keywords": [
+    "cryptography",
+    "e2ee",
+    "end-to-end-encryption",
+    "x25519",
+    "aes-gcm",
+    "hkdf",
+    "pbkdf2",
+    "webcrypto",
+    "ear-742.15"
+  ]
+}
