@@ -15,6 +15,7 @@
 import {
   randomBytes,
   generateAesKey,
+  generateX25519KeyPair,
   aesGcmEncrypt,
   aesGcmDecrypt,
   importPkcs8PrivateKey,
@@ -22,21 +23,27 @@ import {
   exportRawPublicKey,
   importAesKey,
   importRawPublicKey,
+  wrapConversationKey,
   unwrapConversationKey,
   utf8Encode,
   concatBytes,
 } from './crypto.js';
+import { unwrapIdentityWithPassword, decodeBytea } from './userKeys.js';
 
 const IDKEY_AAD_V1 = utf8Encode('camo/idkey-cache/v1');
 const CONVKEY_AAD_V1 = utf8Encode('camo/convkey-cache/v1');
 
 /**
- * KeyStoreAdapter contract (host-provided):
+ * KeyStoreAdapter contract (host-provided). Setters take an *explicit, complete*
+ * field set — there is no merge with the existing row, so a caller that omits
+ * a field would silently null it. Hosts MUST runtime-assert each required
+ * field; see src/web/platform/keyStore.js for the web binding.
+ *
  *   async getWrappingHandle(): CryptoKey | null
- *   async setWrappingHandle(key: CryptoKey): void
- *   async getWrappedIdentity(): { wrapped: Uint8Array, nonce: Uint8Array } | null
- *   async setWrappedIdentity({ wrapped, nonce }): void
- *   async getWrappedConversationKey(conv_id): { wrapped, nonce } | null
+ *   async setWrappingHandle(handle: CryptoKey): void
+ *   async getWrappedIdentity(): { wrapped: Uint8Array, nonce: Uint8Array, pubRaw: Uint8Array } | null
+ *   async setWrappedIdentity({ wrapped, nonce, pubRaw }): void
+ *   async getWrappedConversationKey(conv_id): { wrapped: Uint8Array, nonce: Uint8Array } | null
  *   async setWrappedConversationKey(conv_id, { wrapped, nonce }): void
  *   async clearAll(): void
  */
@@ -135,6 +142,56 @@ export function createKeyManager({ adapter, userId }) {
     await adapter.setWrappedIdentity({ wrapped: ciphertext, nonce, pubRaw: identityPubKeyRaw });
   }
 
+  // Materialise the identity privkey, trying every warm path before falling
+  // back to a server-side unwrap. Used by callers that need pkcs8 bytes for
+  // re-wrapping (password change, identity-key reset, accept-chat-request
+  // fast-path on a cold device, etc.) so the "is the key here?" decision lives
+  // in one place. Phase 2 carry-forward #2 — see docs/encryption.md.
+  //
+  //   - in-memory: cheapest, always tried first
+  //   - IDB cold-start cache: free, no network
+  //   - unwrapIdentityWithPassword: only if `password` is supplied
+  //
+  // Returns one of:
+  //   { ok: true, pkcs8: Uint8Array, pubRaw: Uint8Array,
+  //     source: 'memory' | 'cache' | 'server' }
+  //   { ok: false, reason: 'needs-password' | 'wrong-password' | 'missing-row' | 'export-failed' }
+  async function ensureIdentityKey({ supabase, userId: callerUserId, password } = {}) {
+    const uid = callerUserId || userId;
+
+    if (identityPrivKey) {
+      try {
+        const pkcs8 = await exportPkcs8PrivateKey(identityPrivKey);
+        return { ok: true, pkcs8, pubRaw: identityPubKeyRaw, source: 'memory' };
+      } catch (_e) {
+        // Fall through to next path. extractable:false would land here, but
+        // we always import with extractable:true today.
+      }
+    }
+
+    const cached = await loadIdentityFromCache().catch(() => null);
+    if (cached && identityPrivKey) {
+      try {
+        const pkcs8 = await exportPkcs8PrivateKey(identityPrivKey);
+        return { ok: true, pkcs8, pubRaw: identityPubKeyRaw, source: 'cache' };
+      } catch (_e) {
+        // Same caveat as above.
+      }
+    }
+
+    if (!password || !supabase) {
+      return { ok: false, reason: 'needs-password' };
+    }
+    const r = await unwrapIdentityWithPassword(supabase, uid, password);
+    if (r.error) {
+      // unwrapIdentityWithPassword conflates "no row" and "wrong password" —
+      // surface the more useful default and let the caller refine.
+      return { ok: false, reason: 'wrong-password' };
+    }
+    await adoptIdentityPrivateKey(r.pkcs8, r.pubRaw);
+    return { ok: true, pkcs8: r.pkcs8, pubRaw: r.pubRaw, source: 'server' };
+  }
+
   // ----- conversation keys -----
 
   function getCachedConversationKey(conversationId) {
@@ -169,23 +226,114 @@ export function createKeyManager({ adapter, userId }) {
     return key;
   }
 
-  // Unwrap a server-fetched conversation_keys row using the identity privkey,
-  // then cache the result both in memory and on disk.
-  async function unwrapAndCacheConversationKey(conversationId, {
+  // Sender-side: build a fresh conversation key + wraps for both parties,
+  // for a chat-request send. Returns the raw conv key alongside the wire-
+  // format wrap columns so the caller can both (a) ship the wraps in the
+  // chat_requests insert and (b) keep the raw conv key locally to encrypt
+  // the first messages without waiting for the recipient's accept.
+  //
+  // Reuses a single ephemeral keypair across both wraps — the HKDF info
+  // string mixes in each recipient's identity pubkey, so the resulting
+  // KEKs are independent. See docs/encryption.md → Conversation key creation.
+  async function prepareWrappedConversationKey({ recipientPubKeyRaw }) {
+    if (!(recipientPubKeyRaw instanceof Uint8Array)) {
+      throw new Error('recipientPubKeyRaw must be a Uint8Array');
+    }
+    if (!identityPubKeyRaw) {
+      throw new Error('sender identity public key not loaded');
+    }
+    const convKeyRaw = randomBytes(32);
+    const eph = await generateX25519KeyPair();
+    const ephemeralPublicKeyRaw = await exportRawPublicKey(eph.publicKey);
+    const recipientPub = await importRawPublicKey(recipientPubKeyRaw);
+    const senderPub = await importRawPublicKey(identityPubKeyRaw);
+    const wrappedForRecipient = await wrapConversationKey(
+      eph.privateKey, recipientPub, recipientPubKeyRaw, convKeyRaw,
+    );
+    const wrappedForSender = await wrapConversationKey(
+      eph.privateKey, senderPub, identityPubKeyRaw, convKeyRaw,
+    );
+    return {
+      convKeyRaw,
+      ephemeralPublicKeyRaw,
+      wrappedForRecipient: wrappedForRecipient.wrappedKey,
+      wrappedForRecipientNonce: wrappedForRecipient.nonce,
+      wrappedForSender: wrappedForSender.wrappedKey,
+      wrappedForSenderNonce: wrappedForSender.nonce,
+    };
+  }
+
+  // Unwrap a server-fetched wrapped conversation key using the identity
+  // privkey, returning the raw 32-byte key bytes. The caller can either feed
+  // those bytes into adoptConversationKey (once a conversation_id is known)
+  // or use them transiently. Kept separate from caching so the accept-chat-
+  // request fast-path can decrypt *before* the RPC returns the new
+  // conversation_id (see src/web/screens/requests.js).
+  async function unwrapConversationKeyMaterial({
     wrappedKey,
     wrappedKeyNonce,
     ephemeralPublicKeyRaw,
   }) {
     if (!identityPrivKey) throw new Error('identity key not loaded');
     const ephemeralPub = await importRawPublicKey(ephemeralPublicKeyRaw);
-    const raw = await unwrapConversationKey(
+    return unwrapConversationKey(
       identityPrivKey,
       identityPubKeyRaw,
       ephemeralPub,
       wrappedKey,
       wrappedKeyNonce,
     );
+  }
+
+  // Unwrap a server-fetched conversation_keys row using the identity privkey,
+  // then cache the result both in memory and on disk.
+  async function unwrapAndCacheConversationKey(conversationId, material) {
+    const raw = await unwrapConversationKeyMaterial(material);
     return adoptConversationKey(conversationId, raw);
+  }
+
+  // Read-path ladder: resolve the AES-GCM conversation key for a conv id.
+  //   1. in-memory cache         (warmest, free)
+  //   2. IDB cold-start cache    (free, no network)
+  //   3. server fetch + unwrap   (single SELECT; populates both caches)
+  // Returns the AES-GCM CryptoKey on success, or null if the row is missing,
+  // the identity privkey isn't loaded, or unwrapping fails. The chat-route
+  // composer-gate (docs/encryption.md → Conversation-key prerequisite for
+  // compose) uses the null return to render the "connecting securely…"
+  // disabled-composer state. We deliberately do not throw — every caller
+  // would just have to catch and surface the same state.
+  async function ensureConversationKey({ supabase, conversationId } = {}) {
+    if (!conversationId) return null;
+    const cached = getCachedConversationKey(conversationId);
+    if (cached) return cached;
+    const fromCache = await loadConversationKeyFromCache(conversationId).catch(() => null);
+    if (fromCache) return fromCache;
+    if (!supabase) return null;
+    if (!identityPrivKey) return null;
+    const { data, error } = await supabase
+      .from('conversation_keys')
+      .select('wrapped_key, wrapped_key_nonce, ephemeral_public_key, version')
+      .eq('conversation_id', conversationId)
+      .eq('user_id', userId)
+      .order('version', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error || !data) return null;
+    try {
+      return await unwrapAndCacheConversationKey(conversationId, {
+        wrappedKey: data.wrapped_key instanceof Uint8Array
+          ? data.wrapped_key
+          : decodeBytea(data.wrapped_key),
+        wrappedKeyNonce: data.wrapped_key_nonce instanceof Uint8Array
+          ? data.wrapped_key_nonce
+          : decodeBytea(data.wrapped_key_nonce),
+        ephemeralPublicKeyRaw: data.ephemeral_public_key instanceof Uint8Array
+          ? data.ephemeral_public_key
+          : decodeBytea(data.ephemeral_public_key),
+      });
+    } catch (_e) {
+      return null;
+    }
   }
 
   // ----- lifecycle -----
@@ -205,10 +353,14 @@ export function createKeyManager({ adapter, userId }) {
     refreshCachedIdentity,
     getIdentityPrivateKey,
     getIdentityPublicKeyRaw,
+    ensureIdentityKey,
     adoptConversationKey,
     getCachedConversationKey,
     loadConversationKeyFromCache,
+    prepareWrappedConversationKey,
+    unwrapConversationKeyMaterial,
     unwrapAndCacheConversationKey,
+    ensureConversationKey,
     clearAll,
   };
 }
