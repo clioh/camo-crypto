@@ -302,12 +302,27 @@ export function createKeyManager({ adapter, userId }) {
   // compose) uses the null return to render the "connecting securely…"
   // disabled-composer state. We deliberately do not throw — every caller
   // would just have to catch and surface the same state.
-  async function ensureConversationKey({ supabase, conversationId } = {}) {
+  //
+  // `forceRefresh` skips both warm caches and re-fetches the server-side
+  // `conversation_keys` row, re-importing a *fresh* CryptoKey (new object
+  // identity) and overwriting both caches. The decrypt self-heal path calls
+  // this when a row fails to decrypt under the currently-cached key: if the
+  // cache somehow holds a stale/wrong key for the conversation, this is what
+  // re-syncs it — and the new object identity lets a key-change effect notice
+  // and retry the rows that missed. A no-op-equivalent (same bytes) refresh is
+  // still cheap and safe.
+  async function ensureConversationKey({ supabase, conversationId, forceRefresh = false } = {}) {
     if (!conversationId) return null;
-    const cached = getCachedConversationKey(conversationId);
-    if (cached) return cached;
-    const fromCache = await loadConversationKeyFromCache(conversationId).catch(() => null);
-    if (fromCache) return fromCache;
+    if (!forceRefresh) {
+      const cached = getCachedConversationKey(conversationId);
+      if (cached) return cached;
+      const fromCache = await loadConversationKeyFromCache(conversationId).catch(() => null);
+      if (fromCache) return fromCache;
+    } else {
+      // Drop the warm in-memory handle so the re-adopt below installs a fresh
+      // CryptoKey rather than returning the same (possibly wrong) object.
+      convKeyCache.delete(conversationId);
+    }
     if (!supabase) return null;
     if (!identityPrivKey) return null;
     const { data, error } = await supabase
