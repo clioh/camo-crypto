@@ -303,38 +303,63 @@ export function createKeyManager({ adapter, userId }) {
   // disabled-composer state. We deliberately do not throw — every caller
   // would just have to catch and surface the same state.
   //
-  // `forceRefresh` skips both warm caches and re-fetches the server-side
-  // `conversation_keys` row, re-importing a *fresh* CryptoKey (new object
-  // identity) and overwriting both caches. The decrypt self-heal path calls
-  // this when a row fails to decrypt under the currently-cached key: if the
-  // cache somehow holds a stale/wrong key for the conversation, this is what
-  // re-syncs it — and the new object identity lets a key-change effect notice
-  // and retry the rows that missed. A no-op-equivalent (same bytes) refresh is
-  // still cheap and safe.
+  // `forceRefresh` re-fetches the server-side `conversation_keys` row and, on
+  // success, re-imports a *fresh* CryptoKey (new object identity) overwriting
+  // both caches. The decrypt self-heal path calls this when a row fails to
+  // decrypt under the currently-cached key: if a newer key_version exists
+  // server-side, this re-syncs it — and the new object identity lets a
+  // key-change effect notice and retry the rows that missed. Crucially, a
+  // forced refresh that can't reach the server (or whose fetch/unwrap fails)
+  // returns the *existing* warm key rather than null — it never destroys a key
+  // we already hold (marginal-connectivity invariant). So when forceRefresh
+  // returns the same object it was given, the caller knows nothing changed and
+  // re-running decrypt is pointless.
   async function ensureConversationKey({ supabase, conversationId, forceRefresh = false } = {}) {
     if (!conversationId) return null;
-    if (!forceRefresh) {
-      const cached = getCachedConversationKey(conversationId);
-      if (cached) return cached;
-      const fromCache = await loadConversationKeyFromCache(conversationId).catch(() => null);
-      if (fromCache) return fromCache;
-    } else {
-      // Drop the warm in-memory handle so the re-adopt below installs a fresh
-      // CryptoKey rather than returning the same (possibly wrong) object.
-      convKeyCache.delete(conversationId);
-    }
-    if (!supabase) return null;
-    if (!identityPrivKey) return null;
-    const { data, error } = await supabase
-      .from('conversation_keys')
-      .select('wrapped_key, wrapped_key_nonce, ephemeral_public_key, version')
-      .eq('conversation_id', conversationId)
-      .eq('user_id', userId)
-      .order('version', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (error || !data) return null;
+
+    // Resolve from the durable warm caches first (in-memory → IDB). This is
+    // the value we fall back to no matter what happens below: a conversation
+    // key we have *already resolved on this device* must NEVER be discarded
+    // just because a refresh couldn't reach the server. This is the
+    // marginal-connectivity invariant — decryption of an already-keyed
+    // conversation cannot depend on a live network round-trip. (The old
+    // forceRefresh path deleted the in-memory key and went straight to the
+    // network, so a single `ERR_CONNECTION_RESET` during the decrypt
+    // self-heal would null out a working key and blank every bubble.)
+    const warm =
+      getCachedConversationKey(conversationId) ??
+      (await loadConversationKeyFromCache(conversationId).catch(() => null));
+
+    // Steady state: we have a key and the caller didn't demand a re-fetch.
+    if (warm && !forceRefresh) return warm;
+
+    // We need the network — either there's no warm key at all, or the caller
+    // forced a refresh (the decrypt self-heal suspects the cached key is
+    // stale, e.g. a newer key_version exists server-side). If we can't fetch,
+    // hand back whatever warm key we have (possibly null) rather than nulling
+    // a usable one.
+    if (!supabase || !identityPrivKey) return warm;
+
+    let data, error;
     try {
+      ({ data, error } = await supabase
+        .from('conversation_keys')
+        .select('wrapped_key, wrapped_key_nonce, ephemeral_public_key, version')
+        .eq('conversation_id', conversationId)
+        .eq('user_id', userId)
+        .order('version', { ascending: false })
+        .limit(1)
+        .maybeSingle());
+    } catch (_netErr) {
+      // Connection reset / timeout / abort — the marginal-network case.
+      // Keep the working key in place instead of throwing it away.
+      return warm;
+    }
+    if (error || !data) return warm;
+    try {
+      // On success this overwrites both caches with a *fresh* CryptoKey (new
+      // object identity), which is what lets the chat screen's key-change
+      // effect re-run and retry rows that missed under the previous key.
       return await unwrapAndCacheConversationKey(conversationId, {
         wrappedKey: data.wrapped_key instanceof Uint8Array
           ? data.wrapped_key
@@ -347,7 +372,7 @@ export function createKeyManager({ adapter, userId }) {
           : decodeBytea(data.ephemeral_public_key),
       });
     } catch (_e) {
-      return null;
+      return warm;
     }
   }
 
