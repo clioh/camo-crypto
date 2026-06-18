@@ -376,6 +376,61 @@ export function createKeyManager({ adapter, userId }) {
     }
   }
 
+  // Batch-warm every conversation key the user holds in a SINGLE request,
+  // instead of one `conversation_keys` SELECT per conversation. Used by the
+  // inbox to prefetch keys for the whole sidebar so opening any thread is
+  // instant. RLS scopes `conversation_keys` to `user_id = me`, so this one
+  // query returns exactly the caller's own wrapped keys — bounded by their
+  // conversation count, not the whole table.
+  //
+  // Rows come back ordered (conversation_id asc, version desc) so the first
+  // row seen per conversation is its highest version. Already-warm convs (in
+  // the in-memory cache) are skipped — no redundant unwrap. Unwrapping is
+  // local X25519 work; the only network cost is the lone SELECT. Best-effort:
+  // a failed fetch or a single bad row just leaves that conv to resolve
+  // lazily on open via ensureConversationKey. Returns { warmed } for callers
+  // that want to log/measure.
+  async function warmConversationKeys({ supabase } = {}) {
+    if (!supabase || !identityPrivKey) return { warmed: 0 };
+    let data, error;
+    try {
+      ({ data, error } = await supabase
+        .from('conversation_keys')
+        .select('conversation_id, wrapped_key, wrapped_key_nonce, ephemeral_public_key, version')
+        .eq('user_id', userId)
+        .order('conversation_id', { ascending: true })
+        .order('version', { ascending: false }));
+    } catch (_netErr) {
+      return { warmed: 0 };
+    }
+    if (error || !data) return { warmed: 0 };
+    const seen = new Set();
+    let warmed = 0;
+    for (const row of data) {
+      const cid = row.conversation_id;
+      if (!cid || seen.has(cid)) continue; // first row per conv = top version
+      seen.add(cid);
+      if (convKeyCache.has(cid)) continue; // already warm in memory
+      try {
+        await unwrapAndCacheConversationKey(cid, {
+          wrappedKey: row.wrapped_key instanceof Uint8Array
+            ? row.wrapped_key
+            : decodeBytea(row.wrapped_key),
+          wrappedKeyNonce: row.wrapped_key_nonce instanceof Uint8Array
+            ? row.wrapped_key_nonce
+            : decodeBytea(row.wrapped_key_nonce),
+          ephemeralPublicKeyRaw: row.ephemeral_public_key instanceof Uint8Array
+            ? row.ephemeral_public_key
+            : decodeBytea(row.ephemeral_public_key),
+        });
+        warmed++;
+      } catch (_e) {
+        // Leave this one to resolve lazily on open.
+      }
+    }
+    return { warmed };
+  }
+
   // ----- lifecycle -----
 
   async function clearAll() {
@@ -401,6 +456,7 @@ export function createKeyManager({ adapter, userId }) {
     unwrapConversationKeyMaterial,
     unwrapAndCacheConversationKey,
     ensureConversationKey,
+    warmConversationKeys,
     clearAll,
   };
 }
