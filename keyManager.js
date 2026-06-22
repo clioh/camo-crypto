@@ -29,6 +29,7 @@ import {
   concatBytes,
 } from './crypto.js';
 import { unwrapIdentityWithPassword, decodeBytea } from './userKeys.js';
+import { deriveMeshSigningKeyPair, signWithMeshKey } from './meshSign.js';
 
 const IDKEY_AAD_V1 = utf8Encode('camo/idkey-cache/v1');
 const CONVKEY_AAD_V1 = utf8Encode('camo/convkey-cache/v1');
@@ -56,6 +57,7 @@ export function createKeyManager({ adapter, userId }) {
   let identityPrivKey = null;       // CryptoKey (X25519, deriveBits)
   let identityPubKeyRaw = null;     // Uint8Array
   let wrappingHandle = null;        // CryptoKey (AES-GCM, non-extractable)
+  let meshSigningKeyPair = null;    // { seed, publicKeyRaw } — derived on demand
   const convKeyCache = new Map();   // conversation_id → CryptoKey (AES-GCM)
 
   // ----- wrapping handle -----
@@ -126,6 +128,36 @@ export function createKeyManager({ adapter, userId }) {
 
   function getIdentityPublicKeyRaw() {
     return identityPubKeyRaw;
+  }
+
+  // ----- mesh signing key (Ed25519, derived from the identity privkey) -----
+
+  // Lazily derive + cache the Ed25519 mesh signing keypair. Derivation needs
+  // the identity PKCS#8 bytes, so this materialises the identity key from the
+  // cold-start cache if it isn't already in memory. Returns { seed,
+  // publicKeyRaw } or null when no identity key is available. See docs/mesh.md.
+  async function getMeshSigningKeyPair() {
+    if (meshSigningKeyPair) return meshSigningKeyPair;
+    if (!identityPrivKey) await loadIdentityFromCache().catch(() => {});
+    if (!identityPrivKey) return null;
+    const pkcs8 = await exportPkcs8PrivateKey(identityPrivKey);
+    meshSigningKeyPair = await deriveMeshSigningKeyPair(pkcs8);
+    return meshSigningKeyPair;
+  }
+
+  // Sign mesh-envelope bytes with the derived Ed25519 key. Throws if the
+  // identity key isn't available (the caller can't relay-sign without it).
+  async function signMeshEnvelope(message) {
+    const kp = await getMeshSigningKeyPair();
+    if (!kp) throw new Error('mesh signing key unavailable (identity not loaded)');
+    return signWithMeshKey(kp.seed, message);
+  }
+
+  // The raw 32-byte Ed25519 signing public key, or null if not yet derived.
+  // Returns null rather than deriving — call getMeshSigningKeyPair() first if
+  // you need it materialised.
+  function getMeshSigningPublicKeyRaw() {
+    return meshSigningKeyPair?.publicKeyRaw ?? null;
   }
 
   // Rotate the cached identity privkey on disk after a password change. Server-side
@@ -335,9 +367,14 @@ export function createKeyManager({ adapter, userId }) {
 
     // We need the network — either there's no warm key at all, or the caller
     // forced a refresh (the decrypt self-heal suspects the cached key is
-    // stale, e.g. a newer key_version exists server-side). If we can't fetch,
+    // stale, e.g. a newer key_version exists server-side). The server path
+    // unwraps under the identity private key; lazy-load it from cache if it
+    // isn't in memory yet. Without this, an inbox preview or chat open that
+    // races the app-shell's fire-and-forget identity load would silently
+    // no-op (the "blank previews on cold load" bug). If we still can't fetch,
     // hand back whatever warm key we have (possibly null) rather than nulling
     // a usable one.
+    if (!identityPrivKey) await loadIdentityFromCache().catch(() => {});
     if (!supabase || !identityPrivKey) return warm;
 
     let data, error;
@@ -391,6 +428,7 @@ export function createKeyManager({ adapter, userId }) {
   // lazily on open via ensureConversationKey. Returns { warmed } for callers
   // that want to log/measure.
   async function warmConversationKeys({ supabase } = {}) {
+    if (!identityPrivKey) await loadIdentityFromCache().catch(() => {});
     if (!supabase || !identityPrivKey) return { warmed: 0 };
     let data, error;
     try {
@@ -437,6 +475,7 @@ export function createKeyManager({ adapter, userId }) {
     identityPrivKey = null;
     identityPubKeyRaw = null;
     wrappingHandle = null;
+    meshSigningKeyPair = null;
     convKeyCache.clear();
     await adapter.clearAll();
   }
@@ -448,6 +487,9 @@ export function createKeyManager({ adapter, userId }) {
     refreshCachedIdentity,
     getIdentityPrivateKey,
     getIdentityPublicKeyRaw,
+    getMeshSigningKeyPair,
+    signMeshEnvelope,
+    getMeshSigningPublicKeyRaw,
     ensureIdentityKey,
     adoptConversationKey,
     getCachedConversationKey,
