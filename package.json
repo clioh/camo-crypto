@@ -9,28 +9,22 @@
     ".": "./index.js",
     "./crypto": "./crypto.js",
     "./keyManager": "./keyManager.js",
-    "./meshSign": "./meshSign.js",
     "./wordlist": "./wordlist.js"
   },
   "files": [
     "index.js",
     "crypto.js",
     "keyManager.js",
-    "meshSign.js",
     "wordlist.js",
     "wordlists/",
     "LICENSE",
     "README.md"
   ],
-  "dependencies": {
-    "@noble/curves": "^1.9.7"
-  },
   "keywords": [
     "cryptography",
     "e2ee",
     "end-to-end-encryption",
     "x25519",
-    "ed25519",
     "aes-gcm",
     "hkdf",
     "pbkdf2",
